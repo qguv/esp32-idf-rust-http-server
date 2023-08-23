@@ -1,0 +1,9 @@
+.vscode
+target
+cfg.toml
+__pycache__
+.DS_Store
+.embuild/
+.vale
+.vale.ini
+.container_version

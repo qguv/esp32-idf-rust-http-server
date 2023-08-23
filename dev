@@ -1,0 +1,290 @@
+#!/bin/python3
+
+import argparse
+import os
+import pathlib
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+
+REPO = pathlib.Path(__file__).resolve().parent
+CONTAINER_VERSION = 0
+CONTAINER_VERSION_FILE = REPO / '.container_version'
+
+
+def must_clean_container():
+    if not CONTAINER_VERSION_FILE.exists():
+        return False
+
+    with CONTAINER_VERSION_FILE.open('r') as f:
+        v = int(f.read().strip())
+
+    return v != CONTAINER_VERSION
+
+
+def get_container_state(name):
+    try:
+        out = subprocess.check_output(['sudo', 'podman', 'inspect', '-f', '{{.State.Running}}', name])
+    except subprocess.CalledProcessError:
+        return
+    return out == b'true\n'
+
+
+def _create(container_image, container_name, device):
+    subprocess.check_call(['sudo', 'podman', 'pull', container_image])
+    subprocess.check_call([
+        'sudo', 'podman', 'create',
+        '-it',
+        '--name', container_name,
+        '-v', f'{REPO}:/app',
+        '--device', device,
+        container_image,
+    ])
+    with CONTAINER_VERSION_FILE.open('w') as f:
+        print(CONTAINER_VERSION, file=f)
+
+
+def _start(container_name):
+    subprocess.check_call(['sudo', 'podman', 'start', container_name])
+
+
+def _install_deps(container_name):
+    _exec(container_name, ['cargo', 'install', 'espflash', '--force'])
+
+
+def _device_name(container_name):
+    return subprocess.check_output(['sudo', 'podman', 'inspect', '-f', '{{ range .HostConfig.Devices }}{{ .PathOnHost }}{{ end }}', container_name]).decode('utf-8')[:-1]
+
+
+def start(container_image, container_name, device):
+    state = get_container_state(container_name)
+    needs_deps = False
+    if state is None:
+        _create(container_image, container_name, device)
+        needs_deps = True
+    if not state:
+        _start(container_name)
+    if needs_deps:
+        _install_deps(container_name)
+
+
+def _stop(container_name):
+    subprocess.check_call(['sudo', 'podman', 'stop', container_name])
+
+
+def stop(container_name):
+    state = get_container_state(container_name)
+    if state:
+        _stop(container_name)
+
+
+def _remove(container_name):
+    subprocess.check_call(['sudo', 'podman', 'container', 'rm', container_name])
+
+
+def remove(container_name):
+    state = get_container_state(container_name)
+    if state:
+        _stop(container_name)
+    if state is not None:
+        _remove(container_name)
+    if CONTAINER_VERSION_FILE.exists():
+        CONTAINER_VERSION_FILE.unlink()
+
+
+def cmd_clean(args):
+    changed = False
+    if args.clean_container:
+        changed = True
+        remove(args.name)
+
+    if args.clean_build:
+        changed = True
+        path = (pathlib.Path(args.cd) if args.cd else REPO) / 'target'
+        if path.exists():
+            shutil.rmtree(path)
+
+    if not changed:
+        raise Exception("Specify something to clean!")
+
+
+def _exec(container_name, cmd, cd=None, fork=True):
+    workdir = pathlib.Path('/app')
+    if cd is not None:
+        try:
+            workdir /= pathlib.Path(cd).resolve().relative_to(REPO)
+        except ValueError:
+            raise ValueError(f"Path '{cd}' is not within the repo at '{REPO}'")
+    cmd = ['sudo', 'podman', 'exec', '-it', container_name, 'env', '-C', str(workdir)] + cmd
+    if fork:
+        return subprocess.check_call(cmd)
+    else:
+        os.execvp(cmd[0], cmd)
+
+
+def cmd_exec(args):
+    start(args.image, args.name, args.device)
+    _exec(args.name, [args.CMD] + args.ARGS, cd=args.cd, fork=False)
+
+
+def _cargo(container_name, cmd, cd=None, fork=True):
+    cmd = ['bash', '/app/.guest/cargo.sh'] + cmd
+    _exec(args.name, cmd, cd=cd, fork=fork)
+
+
+def cmd_cargo(args):
+    start(args.image, args.name, args.device)
+    _cargo(args.name, [args.CMD] + args.ARGS, cd=args.cd, fork=False)
+
+
+def _cargo_build(container_name, target, cd=None, fork=True):
+    cmd = ['build']
+    if target == 'release':
+        cmd.append('--release')
+    _cargo(container_name, cmd, cd=cd, fork=fork)
+
+
+def cmd_build(args):
+    start(args.image, args.name, args.device)
+    _cargo_build(args.name, args.target, cd=args.cd, fork=False)
+
+
+def _ensure_same_device(container_name, device_arg):
+    container_device = _device_name(container_name)
+    if container_device != device_arg:
+        raise Exception(f"Error: you've asked to flash {device_arg}, but the container was created to flash {container_device}!")
+
+
+def _get_elf_name(cd=None):
+    cd = REPO if cd is None else pathlib.Path(cd)
+    config_path = cd / 'Cargo.toml'
+    with config_path.open('rb') as f:
+        config = tomllib.load(f)
+        return config['package']['name']
+
+
+def cmd_flash(args):
+    start(args.image, args.name, args.device)
+    _ensure_same_device(args.name, args.device)
+    _cargo_build(args.name, args.target, cd=args.cd)
+    elf_name = _get_elf_name(args.cd)
+    _exec(args.name, ['espflash', 'flash', '-p', args.device, f"target/xtensa-esp32-espidf/{args.target}/{elf_name}"], cd=args.cd, fork=False)
+
+
+def cmd_monitor(args):
+    start(args.image, args.name, args.device)
+    _ensure_same_device(args.name, args.device)
+    _exec(args.name, ['espflash', 'monitor', '-p', args.device], fork=False)
+
+
+def cmd_stop(args):
+    stop(args.name)
+
+
+def cmd_edit(args):
+    cmd = shlex.split(os.environ['EDITOR']) + [pathlib.Path(__file__).resolve()]
+    os.execvp(cmd[0], cmd)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    subparsers = parser.add_subparsers()
+    subparsers.dest = 'subcommand'
+    subparsers.required = True
+
+    _cd_parser = argparse.ArgumentParser(add_help=False)
+    _cd_parser.add_argument('-C', '--cd')
+
+    _cmd_parser = argparse.ArgumentParser(add_help=False)
+    _cmd_parser.add_argument('CMD')
+    _cmd_parser.add_argument('ARGS', nargs='*')
+
+    _device_parser = argparse.ArgumentParser(add_help=False)
+    _device_parser.add_argument('-d', '--device', default='/dev/ttyUSB0')
+
+    _image_parser = argparse.ArgumentParser(add_help=False)
+    _image_parser.add_argument('-i', '--image', default='docker.io/espressif/idf-rust:esp32_1.71.0.1')
+
+    _name_parser = argparse.ArgumentParser(add_help=False)
+    _name_parser.add_argument('-n', '--name', default='esp32-rust')
+
+    _target_parser = argparse.ArgumentParser(add_help=False)
+    _target_parser.add_argument('-t', '--target', default='release')
+
+    build_parser = subparsers.add_parser('build', parents=[
+        _cd_parser,
+        _device_parser,
+        _image_parser,
+        _name_parser,
+        _target_parser,
+    ])
+    build_parser.set_defaults(func=cmd_build)
+
+    cargo_parser = subparsers.add_parser('cargo', parents=[
+        _cd_parser,
+        _cmd_parser,
+        _device_parser,
+        _image_parser,
+        _name_parser,
+    ])
+    cargo_parser.set_defaults(func=cmd_cargo)
+
+    clean_parser = subparsers.add_parser('clean', parents=[
+        _cd_parser,
+        _name_parser,
+    ])
+    clean_parser.add_argument('-c', '--container', dest='clean_container', action='store_true')
+    clean_parser.add_argument('-b', '--build', dest='clean_build', action='store_true')
+    clean_parser.set_defaults(func=cmd_clean)
+
+    edit_parser = subparsers.add_parser('edit')
+    edit_parser.set_defaults(func=cmd_edit)
+
+    exec_parser = subparsers.add_parser('exec', parents=[
+        _cd_parser,
+        _cmd_parser,
+        _device_parser,
+        _image_parser,
+        _name_parser,
+    ])
+    exec_parser.set_defaults(func=cmd_exec)
+
+    flash_parser = subparsers.add_parser('flash', parents=[
+        _cd_parser,
+        _device_parser,
+        _image_parser,
+        _name_parser,
+        _target_parser,
+    ])
+    flash_parser.set_defaults(func=cmd_flash)
+
+    monitor_parser = subparsers.add_parser('monitor', parents=[
+        _device_parser,
+        _image_parser,
+        _name_parser,
+    ])
+    monitor_parser.set_defaults(func=cmd_monitor)
+
+    stop_parser = subparsers.add_parser('stop', parents=[
+        _name_parser,
+    ])
+    stop_parser.set_defaults(func=cmd_stop)
+
+    return parser.parse_args()
+
+
+def main(args):
+    if args.func not in [cmd_clean, cmd_edit, cmd_stop] and must_clean_container():
+        raise Exception(f"Error: a new container is required. To continue, please run:\n\t{sys.argv[0]} clean -c")
+    return args.func(args)
+
+
+args = parse_args()
+try:
+    sys.exit(main(args))
+except Exception as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)

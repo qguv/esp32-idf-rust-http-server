@@ -1,0 +1,4 @@
+[http-server]
+wifi_ssid = "FBI Surveillance Van"
+wifi_psk = "hunter2"
+wifi_ap = true
